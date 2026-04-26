@@ -1,0 +1,658 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <math.h>
+
+// ========================= USER CONFIG =========================
+const char* WIFI_SSID = "YOUR_WIFI_SSID";
+const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
+
+static const int PIN_MUX_S0 = 25;
+static const int PIN_MUX_S1 = 26;
+static const int PIN_MUX_S2 = 27;
+static const int PIN_MUX_OUT = 34;
+
+static const int PIN_BAL_1 = 16;
+static const int PIN_BAL_2 = 17;
+static const int PIN_BAL_3 = 18;
+static const int PIN_BAL_4 = 19;
+static const int PIN_BAL_5 = 21;
+static const int PIN_BAL_6 = 22;
+
+static const int PIN_STATUS_LED = 2;
+
+static const uint8_t  ADC_SAMPLES_PER_READ = 16;
+static const uint16_t MUX_SETTLE_MS        = 5;
+static const float    ADC_VREF             = 3.30f;
+static const int      ADC_MAX              = 4095;
+
+// ========================= CALIBRATION =========================
+float cellScale[6]   = { 1.400f, 1.400f, 1.400f, 1.400f, 1.400f, 1.400f };
+float packScale      = 9.125f;
+float currentOffsetV = 1.650f;
+float currentGainAperV = 10.000f;
+
+// ========================= COULOMB COUNTING CONFIG =========================
+// Battery pack capacity in Ampere-hours (6S Li-ion, tune to your pack)
+float packCapacityAh = 10.0f;
+
+// Coulomb counting efficiency factors
+float chargeEfficiency    = 0.98f;   // η charge (< 1.0)
+float dischargeEfficiency = 1.00f;   // η discharge
+
+// Coulomb counting re-sync thresholds
+// When current is near-zero for this long, trust voltage SOC to re-anchor CC.
+float   ccResyncCurrentThreshA = 0.20f;   // A — "rest" threshold
+uint32_t ccResyncRestDurationMs = 60000;  // 60 s at rest before re-sync
+
+// Initial SOC estimate source: voltage-based, then CC takes over
+float socVoltageWeight = 1.0f;   // starts at 1, fades to 0 after first full cycle
+
+// ========================= SOC VOLTAGE TABLE =========================
+static const uint8_t SOC_TABLE_SIZE = 11;
+float socVoltageTable[SOC_TABLE_SIZE] = {
+  3.00f, 3.20f, 3.30f, 3.40f, 3.50f,
+  3.60f, 3.70f, 3.80f, 3.95f, 4.10f, 4.20f
+};
+float socPercentTable[SOC_TABLE_SIZE] = {
+   0.0f, 10.0f, 20.0f, 30.0f, 40.0f,
+  50.0f, 60.0f, 70.0f, 80.0f, 90.0f, 100.0f
+};
+bool  useMinCellForSocSafety = true;
+float socLowClampCellV       = 3.00f;
+float socHighClampCellV      = 4.20f;
+
+// ========================= BALANCING =========================
+bool  autoBalanceEnabled          = false;
+float balanceStartVoltage         = 4.10f;
+float balanceStopDelta            = 0.03f;
+float minPackVoltageForBalancing  = 20.0f;
+
+// ========================= HISTORY BUFFER (for web graphs) =========================
+// Circular buffer: stores last N samples for graphing.
+static const uint16_t HIST_SIZE = 200;
+
+struct HistPoint {
+  uint32_t t;         // millis timestamp
+  float    packV;
+  float    packI;
+  float    soc;
+  float    cell[6];
+};
+
+HistPoint histBuf[HIST_SIZE];
+uint16_t  histHead = 0;
+uint16_t  histCount = 0;
+
+// ========================= INTERNALS =========================
+WebServer server(80);
+
+struct BmsData {
+  uint16_t raw[8];
+  float    adcVoltage[8];
+  float    cellVoltage[6];
+  float    packVoltage;
+  float    packCurrent;
+  float    avgCellVoltage;
+  float    minCellVoltage;
+  float    maxCellVoltage;
+  float    socPercent;       // fused SOC (CC + voltage re-sync)
+  float    socVoltage;       // pure voltage-SOC (for display/debug)
+  float    chargedAh;        // cumulative Ah charged
+  float    dischargedAh;     // cumulative Ah discharged
+  bool     balanceState[6];
+  unsigned long sampleCounter;
+};
+
+BmsData bms;
+
+// Coulomb counting state
+bool     ccInitialized      = false;
+float    ccSocPercent       = 50.0f;  // CC SOC (overwritten on first init)
+uint32_t ccLastSampleMs     = 0;
+uint32_t ccRestStartMs      = 0;
+bool     ccInRest           = false;
+
+const int balancePins[6] = {
+  PIN_BAL_1, PIN_BAL_2, PIN_BAL_3, PIN_BAL_4, PIN_BAL_5, PIN_BAL_6
+};
+const char* muxChannelNames[8] = {
+  "ADC_C1","ADC_C2","ADC_C3","ADC_C4","ADC_C5","ADC_C6","ADC_ip","ADC_vb"
+};
+
+unsigned long printIntervalMs = 2000;
+
+// ========================= HELPERS =========================
+void setMuxChannel(uint8_t ch) {
+  digitalWrite(PIN_MUX_S0, (ch & 0x01) ? HIGH : LOW);
+  digitalWrite(PIN_MUX_S1, (ch & 0x02) ? HIGH : LOW);
+  digitalWrite(PIN_MUX_S2, (ch & 0x04) ? HIGH : LOW);
+}
+
+uint16_t readMuxRaw(uint8_t ch) {
+  setMuxChannel(ch);
+  delay(MUX_SETTLE_MS);
+  uint32_t sum = 0;
+  for (uint8_t i = 0; i < ADC_SAMPLES_PER_READ; i++) {
+    sum += analogRead(PIN_MUX_OUT);
+    delayMicroseconds(200);
+  }
+  return (uint16_t)(sum / ADC_SAMPLES_PER_READ);
+}
+
+float rawToVoltage(uint16_t raw) {
+  return ((float)raw * ADC_VREF) / (float)ADC_MAX;
+}
+
+void setBalance(uint8_t idx, bool on) {
+  if (idx >= 6) return;
+  bms.balanceState[idx] = on;
+  digitalWrite(balancePins[idx], on ? HIGH : LOW);
+}
+
+void allBalanceOff() {
+  for (uint8_t i = 0; i < 6; i++) setBalance(i, false);
+}
+
+float getMaxCellVoltage() {
+  float v = bms.cellVoltage[0];
+  for (uint8_t i = 1; i < 6; i++) if (bms.cellVoltage[i] > v) v = bms.cellVoltage[i];
+  return v;
+}
+
+float getMinCellVoltage() {
+  float v = bms.cellVoltage[0];
+  for (uint8_t i = 1; i < 6; i++) if (bms.cellVoltage[i] < v) v = bms.cellVoltage[i];
+  return v;
+}
+
+float getAverageCellVoltage() {
+  float s = 0.0f;
+  for (uint8_t i = 0; i < 6; i++) s += bms.cellVoltage[i];
+  return s / 6.0f;
+}
+
+float clampf(float x, float lo, float hi) {
+  return x < lo ? lo : (x > hi ? hi : x);
+}
+
+float interpolateSocFromCellVoltage(float cellV) {
+  cellV = clampf(cellV, socLowClampCellV, socHighClampCellV);
+  if (cellV <= socVoltageTable[0]) return socPercentTable[0];
+  for (uint8_t i = 1; i < SOC_TABLE_SIZE; i++) {
+    if (cellV <= socVoltageTable[i]) {
+      float x0 = socVoltageTable[i-1], x1 = socVoltageTable[i];
+      float y0 = socPercentTable[i-1], y1 = socPercentTable[i];
+      return y0 + (cellV - x0) / (x1 - x0) * (y1 - y0);
+    }
+  }
+  return socPercentTable[SOC_TABLE_SIZE - 1];
+}
+
+// ========================= COULOMB COUNTING =========================
+void updateCoulombCounting() {
+  uint32_t now = millis();
+
+  // --- initialise on first call ---
+  if (!ccInitialized) {
+    float socInput = bms.avgCellVoltage;
+    if (useMinCellForSocSafety)
+      socInput = min(bms.avgCellVoltage, bms.minCellVoltage + 0.03f);
+    ccSocPercent   = interpolateSocFromCellVoltage(socInput);
+    bms.socPercent = ccSocPercent;
+    ccLastSampleMs  = now;
+    ccRestStartMs   = now;
+    ccInitialized   = true;
+    return;
+  }
+
+  float dtH = (float)(now - ccLastSampleMs) / 3600000.0f;  // Δt in hours
+  ccLastSampleMs = now;
+
+  float I = bms.packCurrent;
+
+  // --- integrate charge ---
+  if (I > 0.0f) {
+    // Charging
+    float dAh = I * dtH * chargeEfficiency;
+    bms.chargedAh += dAh;
+    ccSocPercent  += (dAh / packCapacityAh) * 100.0f;
+  } else if (I < 0.0f) {
+    // Discharging
+    float dAh = fabs(I) * dtH / dischargeEfficiency;
+    bms.dischargedAh += dAh;
+    ccSocPercent     -= (dAh / packCapacityAh) * 100.0f;
+  }
+
+  ccSocPercent = clampf(ccSocPercent, 0.0f, 100.0f);
+
+  // --- voltage-based re-sync at rest ---
+  bool isResting = (fabs(I) < ccResyncCurrentThreshA);
+  if (isResting) {
+    if (!ccInRest) {
+      ccInRest      = true;
+      ccRestStartMs = now;
+    }
+    if ((now - ccRestStartMs) >= ccResyncRestDurationMs) {
+      // Pack has been at rest long enough — voltage is reliable
+      float socInput = bms.avgCellVoltage;
+      if (useMinCellForSocSafety)
+        socInput = min(bms.avgCellVoltage, bms.minCellVoltage + 0.03f);
+      float voltSoc = interpolateSocFromCellVoltage(socInput);
+
+      // Soft re-sync: blend CC toward voltage (0.1 per cycle)
+      ccSocPercent = ccSocPercent * 0.90f + voltSoc * 0.10f;
+    }
+  } else {
+    ccInRest = false;
+  }
+
+  bms.socPercent = ccSocPercent;
+
+  // Keep a pure voltage SOC for reference
+  float socInput = bms.avgCellVoltage;
+  if (useMinCellForSocSafety)
+    socInput = min(bms.avgCellVoltage, bms.minCellVoltage + 0.03f);
+  bms.socVoltage = interpolateSocFromCellVoltage(socInput);
+}
+
+// ========================= BALANCING =========================
+void updateAutoBalancing() {
+  if (!autoBalanceEnabled) { allBalanceOff(); return; }
+  if (bms.packVoltage < minPackVoltageForBalancing) { allBalanceOff(); return; }
+
+  float maxCell = getMaxCellVoltage();
+  float minCell = getMinCellVoltage();
+  if ((maxCell - minCell) < balanceStopDelta) { allBalanceOff(); return; }
+
+  for (uint8_t i = 0; i < 6; i++) {
+    bool en = (bms.cellVoltage[i] >= balanceStartVoltage) &&
+              ((bms.cellVoltage[i] - minCell) >= balanceStopDelta);
+    setBalance(i, en);
+  }
+}
+
+// ========================= SAMPLING =========================
+void sampleAllChannels() {
+  for (uint8_t ch = 0; ch < 8; ch++) {
+    bms.raw[ch]        = readMuxRaw(ch);
+    bms.adcVoltage[ch] = rawToVoltage(bms.raw[ch]);
+  }
+  for (uint8_t i = 0; i < 6; i++)
+    bms.cellVoltage[i] = bms.adcVoltage[i] * cellScale[i];
+
+  bms.packCurrent     = (bms.adcVoltage[6] - currentOffsetV) * currentGainAperV;
+  bms.packVoltage     = bms.adcVoltage[7] * packScale;
+  bms.minCellVoltage  = getMinCellVoltage();
+  bms.maxCellVoltage  = getMaxCellVoltage();
+  bms.avgCellVoltage  = getAverageCellVoltage();
+
+  updateCoulombCounting();
+  updateAutoBalancing();
+  bms.sampleCounter++;
+
+  // --- push to history ring buffer ---
+  histBuf[histHead] = {
+    millis(),
+    bms.packVoltage,
+    bms.packCurrent,
+    bms.socPercent,
+    { bms.cellVoltage[0], bms.cellVoltage[1], bms.cellVoltage[2],
+      bms.cellVoltage[3], bms.cellVoltage[4], bms.cellVoltage[5] }
+  };
+  histHead  = (histHead + 1) % HIST_SIZE;
+  if (histCount < HIST_SIZE) histCount++;
+}
+
+// ========================= JSON =========================
+String jsonStatus() {
+  String s = "{";
+  s += "\"samples\":"      + String(bms.sampleCounter)    + ",";
+  s += "\"pack_voltage\":"  + String(bms.packVoltage,3)   + ",";
+  s += "\"pack_current\":"  + String(bms.packCurrent,3)   + ",";
+  s += "\"avg_cell_v\":"    + String(bms.avgCellVoltage,3)+ ",";
+  s += "\"min_cell_v\":"    + String(bms.minCellVoltage,3)+ ",";
+  s += "\"max_cell_v\":"    + String(bms.maxCellVoltage,3)+ ",";
+  s += "\"soc_cc\":"        + String(bms.socPercent,2)    + ",";
+  s += "\"soc_v\":"         + String(bms.socVoltage,2)    + ",";
+  s += "\"charged_ah\":"    + String(bms.chargedAh,4)     + ",";
+  s += "\"discharged_ah\":" + String(bms.dischargedAh,4)  + ",";
+  s += "\"cell_voltages\":[";
+  for (uint8_t i = 0; i < 6; i++) {
+    s += String(bms.cellVoltage[i],3);
+    if (i<5) s += ",";
+  }
+  s += "],\"balance\":[";
+  for (uint8_t i = 0; i < 6; i++) {
+    s += bms.balanceState[i] ? "true" : "false";
+    if (i<5) s += ",";
+  }
+  s += "],\"adc_raw\":[";
+  for (uint8_t i = 0; i < 8; i++) { s += String(bms.raw[i]); if(i<7) s+=","; }
+  s += "]}";
+  return s;
+}
+
+// History endpoint: returns the last N points as JSON arrays for charting
+String jsonHistory() {
+  String s = "{\"t\":[],\"packV\":[],\"packI\":[],\"soc\":[],\"cells\":[[],[],[],[],[],[]]}\n";
+  // Rebuild properly
+  s = "{\"t\":[";
+  uint16_t start = (histCount < HIST_SIZE) ? 0 : histHead;
+  for (uint16_t k = 0; k < histCount; k++) {
+    uint16_t idx = (start + k) % HIST_SIZE;
+    s += String(histBuf[idx].t);
+    if (k < histCount-1) s += ",";
+  }
+  s += "],\"packV\":[";
+  for (uint16_t k = 0; k < histCount; k++) {
+    uint16_t idx = (start + k) % HIST_SIZE;
+    s += String(histBuf[idx].packV,2);
+    if (k < histCount-1) s += ",";
+  }
+  s += "],\"packI\":[";
+  for (uint16_t k = 0; k < histCount; k++) {
+    uint16_t idx = (start + k) % HIST_SIZE;
+    s += String(histBuf[idx].packI,2);
+    if (k < histCount-1) s += ",";
+  }
+  s += "],\"soc\":[";
+  for (uint16_t k = 0; k < histCount; k++) {
+    uint16_t idx = (start + k) % HIST_SIZE;
+    s += String(histBuf[idx].soc,1);
+    if (k < histCount-1) s += ",";
+  }
+  s += "],\"cells\":[";
+  for (uint8_t c = 0; c < 6; c++) {
+    s += "[";
+    for (uint16_t k = 0; k < histCount; k++) {
+      uint16_t idx = (start + k) % HIST_SIZE;
+      s += String(histBuf[idx].cell[c],3);
+      if (k < histCount-1) s += ",";
+    }
+    s += "]";
+    if (c < 5) s += ",";
+  }
+  s += "]}";
+  return s;
+}
+
+// ========================= WEB DASHBOARD =========================
+void handleRoot() {
+  // Full dashboard with live Chart.js graphs, auto-refreshes via fetch()
+  String html = R"rawhtml(
+<!DOCTYPE html><html><head>
+<meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>ESP32 BMS Dashboard</title>
+<script src='https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js'></script>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:sans-serif;background:#0f172a;color:#e2e8f0;padding:16px}
+  h1{font-size:18px;font-weight:500;margin-bottom:16px;color:#94a3b8}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:20px}
+  .card{background:#1e293b;border-radius:10px;padding:12px 14px}
+  .card .lbl{font-size:11px;color:#64748b;margin-bottom:4px}
+  .card .val{font-size:22px;font-weight:500;color:#f1f5f9}
+  .card .unit{font-size:12px;color:#94a3b8;margin-left:2px}
+  .charts{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:20px}
+  @media(max-width:600px){.charts{grid-template-columns:1fr}}
+  .chart-box{background:#1e293b;border-radius:10px;padding:14px}
+  .chart-box h3{font-size:12px;color:#64748b;margin-bottom:10px;font-weight:400}
+  canvas{display:block}
+  .cells{display:grid;grid-template-columns:repeat(6,1fr);gap:8px;margin-bottom:16px}
+  .cell{background:#1e293b;border-radius:8px;padding:10px 6px;text-align:center}
+  .cell .cv{font-size:15px;font-weight:500}
+  .cell .cl{font-size:10px;color:#64748b;margin-top:2px}
+  .cell.bal{border:1px solid #f59e0b}
+  .footer{font-size:11px;color:#475569;text-align:center;margin-top:8px}
+  .soc-bar{height:14px;background:#1e293b;border-radius:7px;overflow:hidden;margin-top:6px}
+  .soc-fill{height:100%;border-radius:7px;transition:width .4s}
+</style>
+</head><body>
+<h1>ESP32 BMS — Live Dashboard</h1>
+
+<div class='cards'>
+  <div class='card'><div class='lbl'>Pack voltage</div><div class='val' id='pv'>—<span class='unit'>V</span></div></div>
+  <div class='card'><div class='lbl'>Current</div><div class='val' id='pi'>—<span class='unit'>A</span></div></div>
+  <div class='card'>
+    <div class='lbl'>SOC (Coulomb)</div>
+    <div class='val' id='soc'>—<span class='unit'>%</span></div>
+    <div class='soc-bar'><div class='soc-fill' id='socbar' style='width:0%;background:#22c55e'></div></div>
+  </div>
+  <div class='card'><div class='lbl'>SOC (voltage)</div><div class='val' id='socv'>—<span class='unit'>%</span></div></div>
+  <div class='card'><div class='lbl'>Charged</div><div class='val' id='chAh'>—<span class='unit'>Ah</span></div></div>
+  <div class='card'><div class='lbl'>Discharged</div><div class='val' id='dcAh'>—<span class='unit'>Ah</span></div></div>
+</div>
+
+<div class='cells' id='cellGrid'></div>
+
+<div class='charts'>
+  <div class='chart-box'><h3>SOC % — Coulomb counting</h3><div style='position:relative;height:160px'><canvas id='cSOC'></canvas></div></div>
+  <div class='chart-box'><h3>Pack voltage (V)</h3><div style='position:relative;height:160px'><canvas id='cV'></canvas></div></div>
+  <div class='chart-box'><h3>Pack current (A)</h3><div style='position:relative;height:160px'><canvas id='cI'></canvas></div></div>
+  <div class='chart-box'><h3>Cell voltages (V)</h3><div style='position:relative;height:160px'><canvas id='cCells'></canvas></div></div>
+</div>
+
+<div class='footer' id='ft'>Connecting…</div>
+
+<script>
+const COLORS=['#38bdf8','#4ade80','#fb923c','#f472b6','#a78bfa','#facc15'];
+const mkChart=(id,label,color,yMin,yMax)=>new Chart(document.getElementById(id),{
+  type:'line',
+  data:{labels:[],datasets:[{label,data:[],borderColor:color,borderWidth:1.5,pointRadius:0,fill:false,tension:0.3}]},
+  options:{responsive:true,maintainAspectRatio:false,animation:false,
+    scales:{x:{display:false},y:{min:yMin,max:yMax,ticks:{color:'#94a3b8',font:{size:10}},grid:{color:'rgba(255,255,255,.05)'}}},
+    plugins:{legend:{display:false}}}
+});
+
+const mkCellChart=(id)=>new Chart(document.getElementById(id),{
+  type:'line',
+  data:{labels:[],datasets:COLORS.map((c,i)=>({label:'C'+(i+1),data:[],borderColor:c,borderWidth:1.2,pointRadius:0,fill:false,tension:0.3}))},
+  options:{responsive:true,maintainAspectRatio:false,animation:false,
+    scales:{x:{display:false},y:{ticks:{color:'#94a3b8',font:{size:10}},grid:{color:'rgba(255,255,255,.05)'}}},
+    plugins:{legend:{labels:{color:'#94a3b8',font:{size:10},boxWidth:8}}}}
+});
+
+const socChart  = mkChart('cSOC','SOC','#22c55e',0,100);
+const vChart    = mkChart('cV','V','#38bdf8',null,null);
+const iChart    = mkChart('cI','A','#fb923c',null,null);
+const cellChart = mkCellChart('cCells');
+
+const MAX_PTS = 120;
+function push(chart, label, ...vals){
+  chart.data.labels.push(label);
+  if(chart.data.labels.length>MAX_PTS){chart.data.labels.shift();}
+  vals.forEach((v,i)=>{
+    chart.data.datasets[i].data.push(v);
+    if(chart.data.datasets[i].data.length>MAX_PTS) chart.data.datasets[i].data.shift();
+  });
+  chart.update('none');
+}
+
+function socColor(s){
+  if(s>50) return '#22c55e';
+  if(s>20) return '#f59e0b';
+  return '#ef4444';
+}
+
+let lastSamples=0;
+async function fetchStatus(){
+  try{
+    const r=await fetch('/api/status');
+    const d=await r.json();
+    const t=new Date().toLocaleTimeString();
+
+    document.getElementById('pv').childNodes[0].textContent=d.pack_voltage.toFixed(2);
+    document.getElementById('pi').childNodes[0].textContent=d.pack_current.toFixed(2);
+    const s=parseFloat(d.soc_cc);
+    document.getElementById('soc').childNodes[0].textContent=s.toFixed(1);
+    document.getElementById('socv').childNodes[0].textContent=parseFloat(d.soc_v).toFixed(1);
+    document.getElementById('chAh').childNodes[0].textContent=parseFloat(d.charged_ah).toFixed(3);
+    document.getElementById('dcAh').childNodes[0].textContent=parseFloat(d.discharged_ah).toFixed(3);
+
+    const bar=document.getElementById('socbar');
+    bar.style.width=s.toFixed(1)+'%';
+    bar.style.background=socColor(s);
+
+    // cell grid
+    const grid=document.getElementById('cellGrid');
+    if(grid.children.length===0){
+      for(let i=0;i<6;i++){
+        const c=document.createElement('div');
+        c.className='cell';
+        c.id='cell'+i;
+        c.innerHTML=`<div class='cv' id='cv${i}'>—</div><div class='cl'>Cell ${i+1}</div>`;
+        grid.appendChild(c);
+      }
+    }
+    d.cell_voltages.forEach((v,i)=>{
+      document.getElementById('cv'+i).textContent=v.toFixed(3);
+      const el=document.getElementById('cell'+i);
+      el.className='cell'+(d.balance[i]?' bal':'');
+    });
+
+    if(d.samples!==lastSamples){
+      push(socChart,t,s);
+      push(vChart,t,d.pack_voltage);
+      push(iChart,t,d.pack_current);
+      const cellChart2=Chart.getChart('cCells');
+      cellChart2.data.labels.push(t);
+      if(cellChart2.data.labels.length>MAX_PTS) cellChart2.data.labels.shift();
+      d.cell_voltages.forEach((v,i)=>{
+        cellChart2.data.datasets[i].data.push(v);
+        if(cellChart2.data.datasets[i].data.length>MAX_PTS) cellChart2.data.datasets[i].data.shift();
+      });
+      cellChart2.update('none');
+      lastSamples=d.samples;
+    }
+
+    document.getElementById('ft').textContent='Updated '+t+' | Samples: '+d.samples;
+  }catch(e){
+    document.getElementById('ft').textContent='Connection error — retrying…';
+  }
+}
+
+fetchStatus();
+setInterval(fetchStatus,1000);
+</script>
+</body></html>
+)rawhtml";
+  server.send(200, "text/html", html);
+}
+
+// ========================= SERVER ROUTES =========================
+void handleApiStatus() {
+  String j = jsonStatus();
+  // Patch in the CC fields already in jsonStatus
+  server.send(200, "application/json", j);
+}
+
+void handleApiHistory() {
+  server.send(200, "application/json", jsonHistory());
+}
+
+void handleAllBalanceOff() {
+  autoBalanceEnabled = false; allBalanceOff();
+  server.send(200, "text/plain", "All balancing OFF");
+}
+
+void handleAutoOn()  { autoBalanceEnabled = true;  server.send(200,"text/plain","Auto ON"); }
+void handleAutoOff() { autoBalanceEnabled = false; allBalanceOff(); server.send(200,"text/plain","Auto OFF"); }
+
+void handleBalanceManual() {
+  if (!server.hasArg("cell") || !server.hasArg("state")) {
+    server.send(400, "text/plain", "Use /balance/set?cell=1..6&state=0|1");
+    return;
+  }
+  int cell  = server.arg("cell").toInt();
+  int state = server.arg("state").toInt();
+  if (cell < 1 || cell > 6) { server.send(400,"text/plain","Cell 1..6"); return; }
+  autoBalanceEnabled = false;
+  setBalance(cell-1, state != 0);
+  server.send(200,"text/plain","OK");
+}
+
+// ========================= SERIAL REPORT =========================
+void printSerialReport() {
+  Serial.println("====================================================");
+  Serial.printf("Samples: %lu\n", bms.sampleCounter);
+  Serial.printf("Pack  %.3f V | %.3f A\n", bms.packVoltage, bms.packCurrent);
+  Serial.printf("SOC (CC)=%.2f%% | SOC (V)=%.2f%%\n", bms.socPercent, bms.socVoltage);
+  Serial.printf("Charged=%.4fAh | Discharged=%.4fAh\n", bms.chargedAh, bms.dischargedAh);
+  for (uint8_t i = 0; i < 6; i++)
+    Serial.printf("Cell %u=%.3fV BAL=%s\n", i+1, bms.cellVoltage[i], bms.balanceState[i]?"ON":"OFF");
+}
+
+// ========================= SETUP =========================
+void setupWiFi() {
+  if (String(WIFI_SSID) == "YOUR_WIFI_SSID") {
+    Serial.println("Wi-Fi not configured — offline mode."); return;
+  }
+  WiFi.mode(WIFI_STA); WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("Connecting");
+  unsigned long t = millis();
+  while (WiFi.status() != WL_CONNECTED && millis()-t < 15000) { delay(500); Serial.print("."); }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("IP: "); Serial.println(WiFi.localIP());
+  } else { Serial.println("Wi-Fi timeout — offline."); }
+}
+
+void setupServer() {
+  server.on("/",               handleRoot);
+  server.on("/api/status",     handleApiStatus);
+  server.on("/api/history",    handleApiHistory);
+  server.on("/balance/off",    handleAllBalanceOff);
+  server.on("/balance/auto/on",  handleAutoOn);
+  server.on("/balance/auto/off", handleAutoOff);
+  server.on("/balance/set",    handleBalanceManual);
+  server.begin();
+  Serial.println("HTTP server started.");
+}
+
+void setupPins() {
+  pinMode(PIN_MUX_S0, OUTPUT);
+  pinMode(PIN_MUX_S1, OUTPUT);
+  pinMode(PIN_MUX_S2, OUTPUT);
+  for (uint8_t i = 0; i < 6; i++) {
+    pinMode(balancePins[i], OUTPUT);
+    digitalWrite(balancePins[i], LOW);
+    bms.balanceState[i] = false;
+  }
+  if (PIN_STATUS_LED >= 0) { pinMode(PIN_STATUS_LED, OUTPUT); digitalWrite(PIN_STATUS_LED, LOW); }
+}
+
+void setupAdc() {
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("ESP32 BMS starting (Coulomb Counting + Live Dashboard)…");
+  setupPins();
+  setupAdc();
+  allBalanceOff();
+  setupWiFi();
+  setupServer();
+  sampleAllChannels();  // initialises CC from voltage
+  Serial.println("Ready.");
+}
+
+void loop() {
+  static unsigned long lastSample = 0;
+  static unsigned long lastPrint  = 0;
+  static bool ledState = false;
+  unsigned long now = millis();
+
+  if (now - lastSample >= 300) {
+    lastSample = now;
+    sampleAllChannels();
+    if (PIN_STATUS_LED >= 0) { ledState = !ledState; digitalWrite(PIN_STATUS_LED, ledState); }
+  }
+  if (now - lastPrint >= printIntervalMs) {
+    lastPrint = now;
+    printSerialReport();
+  }
+  server.handleClient();
+}
