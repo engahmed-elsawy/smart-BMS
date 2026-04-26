@@ -1,0 +1,4 @@
+Record=TopLevelDocument|FileName=CellsVoltMeasurementSensor.SchDoc|SheetNumber=1
+Record=NoMainPathDocument|SourceDocument=CellsVoltMeasurementSensor.SchDoc|FileName=Controller.SchDoc|SheetNumber=4
+Record=NoMainPathDocument|SourceDocument=CellsVoltMeasurementSensor.SchDoc|FileName=PackVoltageCurrentSensor.SchDoc|SheetNumber=3
+Record=NoMainPathDocument|SourceDocument=CellsVoltMeasurementSensor.SchDoc|FileName=Passive Balancing.SchDoc|SheetNumber=2
